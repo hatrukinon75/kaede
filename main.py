@@ -11,7 +11,7 @@ ROLES_ORDER = ['大崎', '有明', '新橋', '青海', '静馬', '汐留', '竹�
 bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
 
 def get_member_name(interaction, member_id):
-    if isinstance(member_id, str): return member_id
+    # すべてMember ID(int)とみなす
     member = interaction.guild.get_member(member_id)
     return member.display_name if member else f"ID:{member_id}"
 
@@ -20,26 +20,16 @@ class GameSession:
         self.assignment_map = assignment_map
         self.lovers = {}
         self.osaki_list = assignment_map.get('大崎', [])
-        # 参加者のリストを保持
         self.participants = participants 
 
     def get_name(self, member_id):
-        # 1. 直接辞書を探すのではなく、参加者リストから名前を検索する
+        # 参加者リストからメンバーを検索
         for p in self.participants:
-            # メンバーならIDを比較
-            if isinstance(p, discord.Member) and p.id == member_id:
-                # display_nameが取れない場合はname(ユーザー名)を返す
-                return p.display_name or p.name
-            # 文字列（ダミーなど）ならそのまま比較
-            elif str(p) == str(member_id):
-                return str(p)
-        
-        # 2. それでも見つからない場合（bot再起動などでキャッシュが消えた時用）
-        # クライアント経由でユーザー情報を再取得する
+            if p.id == member_id:
+                return p.display_name
         return f"ID:{member_id}"
 
     def is_osaki(self, member_id):
-        # assignment_mapの中にいるか確認
         return member_id in self.osaki_list
 
     def set_lover(self, member_id, lover_id):
@@ -54,6 +44,14 @@ class GameSession:
             if member_id in members:
                 return role
         return "役職なし"
+
+async def send_dm_to_member(interaction, member_id, message, view=None):
+    member = await interaction.client.fetch_user(member_id)
+    if member:
+        try:
+            await member.send(message, view=view)
+        except Exception as e:
+            print(f"DM送信中にエラー発生: {e}")
 
 async def send_dm_to_member(interaction, member_id, message, view=None):
     """メンバーIDから確実にDMを送るための共通関数"""
@@ -179,11 +177,24 @@ class RoleCounterView(discord.ui.View):
         await interaction.response.edit_message(view=new_view)
 
     async def next_page(self, interaction):
+        # ページ送りのロジック
         if (self.page + 1) * 5 < len(ROLES_ORDER):
-            # ★修正: rule_type を渡す
             new_view = RoleCounterView(self.participants, self.counts, self.page + 1, self.rule_type)
             await interaction.response.edit_message(view=new_view)
         else:
+            # --- ここにバリデーション（人数チェック）を追加 ---
+            total_assigned = sum(self.counts.values())
+            
+            # 一色ルール以外の時だけチェックする
+            if self.rule_type != "monochrome" and total_assigned != len(self.participants):
+                await interaction.response.send_message(
+                    f"合っていません。人数\n設定合計: {total_assigned}名 / 参加者: {len(self.participants)}名\n合計が参加人数と一致するように調整してください。",
+                    ephemeral=True
+                )
+                return
+            # ---------------------------------------------
+
+            # 人数が合っていれば配役実行へ進む
             await execute_assignment(interaction, self.participants, self.counts, self.rule_type)
 
 # --- 4. ルール選択View (2ボタン式) ---
@@ -236,13 +247,6 @@ class EntryView(discord.ui.View):
         else:
             await interaction.response.send_message("既に参加しています。", ephemeral=True)
 
-    # --- ダミー追加ボタン ---
-    @discord.ui.button(label="デバッグ：ダミー追加", style=discord.ButtonStyle.secondary)
-    async def debug(self, interaction, button):
-        dummy_name = f"Dummy_{len(self.participants) + 1}"
-        self.participants.append(dummy_name)
-        await interaction.response.send_message(f"{dummy_name} を追加しました！(現在{len(self.participants)}名)", ephemeral=True)
-        
     @discord.ui.button(label="ルール選択へ", style=discord.ButtonStyle.primary)
     async def next(self, interaction, button):
         await interaction.response.send_message(view=RuleSelectionView(self.participants), ephemeral=True)
@@ -271,8 +275,8 @@ class OsakiDecisionView(discord.ui.View):
         await send_dm_to_member(
             interaction, 
             self.candidate, 
-            f"{o_name} さんが指名を承諾しました。\nあなたと {o_name} さんが恋人関係になります。下の『確認』ボタンを押して処理を完了してください。",
-            view=CandidateConfirmView(self.shizuma, o_name, self.candidate)
+            f"{o_name} さんが指名を承諾しました。\nあなたと {o_name} さんが恋人関係になります。確認ボタンを押して処理を完了してください。",
+            view=CandidateConfirmView(self.session, self.shizuma, o_name, self.candidate)
         )
 
     @discord.ui.button(label="拒否", style=discord.ButtonStyle.danger)
@@ -285,8 +289,8 @@ class OsakiDecisionView(discord.ui.View):
         if shizuma_user:
             o_name = self.session.get_name(self.osaki)
             await shizuma_user.send(
-                f"{o_name} さんが拒否しました。あなたと {o_name} さんが恋人になりました。",
-                view=CandidateConfirmView(self.shizuma, o_name, self.osaki)
+                f"{o_name} さんが拒否しました。 {o_name} さんはあなたと恋人になりたいようです。",
+                view=CandidateConfirmView(self.session, self.shizuma, o_name, self.osaki)
             )
 
 class OsakiSelectorView(discord.ui.View):
@@ -302,7 +306,7 @@ class OsakiSelectorView(discord.ui.View):
             label = f"大崎さん ({name})"
             options.append(discord.SelectOption(label=label, value=str(osaki_id)))
             
-        self.select = discord.ui.Select(placeholder="好きな大崎さんを選んでください", options=options)
+        self.select = discord.ui.Select(placeholder="選んでください。好きな大崎さん。", options=options)
         self.select.callback = self.select_osaki 
         self.add_item(self.select)
 
@@ -322,7 +326,7 @@ class OsakiSelectorView(discord.ui.View):
             interaction, 
             osaki_id, 
             f"{picker_name} さんから恋人として指名されました。確認ボタンを押して処理を完了してください。",
-            view=CandidateConfirmView(self.shizuma_id, picker_name, osaki_id)
+            view=CandidateConfirmView(self.session, self.shizuma_id, picker_name, osaki_id)
         )
 
 
@@ -335,34 +339,26 @@ class LoverSelectionView(discord.ui.View):
         
         options = []
         for u in participants:
-            u_identifier = u.id if isinstance(u, discord.Member) else u
-            if u_identifier == self.shizuma_id: continue
+            if u.id == self.shizuma_id: continue
             
-            role_name = self.session.get_role_by_member(u_identifier)
-            name = u.name if isinstance(u, discord.Member) else str(u)
-            label = f"{name} ({role_name})"
-            options.append(discord.SelectOption(label=label, value=str(u_identifier)))
+            role_name = self.session.get_role_by_member(u.id)
+            label = f"{u.display_name} ({role_name})"
+            options.append(discord.SelectOption(label=label, value=str(u.id)))
         
         self.select = discord.ui.Select(placeholder="恋人候補を選択", options=options)
-        self.select.callback = self.select_lover # クラス内のメソッド
+        self.select.callback = self.select_lover
         self.add_item(self.select)
 
     async def select_lover(self, interaction: discord.Interaction):
-        target_val = self.select.values[0]
-        target_id = int(target_val) if target_val.isdigit() else target_val
+        target_id = int(self.select.values[0])
         
-## debug
-        print(f"DEBUG: target_id={target_id}, is_osaki={self.session.is_osaki(target_id)}")
-
-## debug
         if self.session.is_osaki(target_id):
             await interaction.response.send_message("大崎さんですね。恋人にする相手を選んでください。", ephemeral=True)
             await interaction.followup.send("相手選択:", 
                                             view=OsakiCandidateSelectionView(self.session, self.shizuma_id, target_id, self.participants), 
                                             ephemeral=True)
         else:
-            # ★修正: self.shizuma_id を渡すように変更
-            await send_dm_to_member(interaction, target_id, "不純同性交友の指名です。大崎一覧から選んでください。", 
+            await send_dm_to_member(interaction, target_id, "不純同性交友の指名です。選んでください。大崎さんから", 
                                     view=OsakiSelectorView(self.session, target_id, self.shizuma_id))
             await interaction.response.send_message("相手に指名を送りました。", ephemeral=True)
 
@@ -375,55 +371,46 @@ class OsakiCandidateSelectionView(discord.ui.View):
         
         options = []
         for u in participants:
-            # ★修正: id属性がある場合(Member)とない場合(str)を分けて取得
-            u_id = u.id if hasattr(u, 'id') else u
-            u_name = u.display_name if hasattr(u, 'display_name') else str(u)
-            
             # 静馬と大崎本人を除外
-            if u_id in [shizuma_id, osaki_id]:
+            if u.id in [shizuma_id, osaki_id] or self.session.is_osaki(u.id):
                 continue
             
-            role_name = self.session.get_role_by_member(u_id)
-            label = f"{u_name} ({role_name})"
-            options.append(discord.SelectOption(label=label, value=str(u_id)))
+            role_name = self.session.get_role_by_member(u.id)
+            label = f"{u.display_name} ({role_name})"
+            options.append(discord.SelectOption(label=label, value=str(u.id)))
             
         self.select = discord.ui.Select(placeholder="恋人候補を選択", options=options)
         self.select.callback = self.select_candidate
         self.add_item(self.select)
 
-    # クラスの中に正しく移動しました
     async def select_candidate(self, interaction: discord.Interaction):
-        val = self.select.values[0]
-        # 数字ならintに変換、それ以外（Dummyなど）はそのまま文字列として扱う
-        candidate_id = int(val) if val.isdigit() else val
-        
+        candidate_id = int(self.select.values[0])
         candidate_name = self.session.get_name(candidate_id)
         
-        # 相手が大崎(Dummy)の場合はDMが送れないので考慮が必要
-        # ここではDM送信を「メンバー(整数ID)のみ」に制限してエラーを防ぐ
-        if isinstance(candidate_id, int):
-            msg = f"静馬から指名されました。相手は {candidate_name} です。承諾しますか？"
-            await send_dm_to_member(interaction, self.osaki_id, msg, 
-                                    view=OsakiDecisionView(self.session, self.shizuma_id, self.osaki_id, candidate_id))
-            await interaction.response.send_message("大崎さんに交渉を依頼しました。", ephemeral=True)
-        else:
-            # ダミー相手の場合の処理
-            await interaction.response.send_message(f"{candidate_name} さんはダミーのためDMを送れませんが、承諾したとみなして処理を続けます。", ephemeral=True)
-            # 必要に応じてここで self.session.set_lover などを呼び出してください
+        msg = f"静馬から指名されました。相手は {candidate_name} さんです。承諾しますか？"
+        await send_dm_to_member(interaction, self.osaki_id, msg, 
+                                view=OsakiDecisionView(self.session, self.shizuma_id, self.osaki_id, candidate_id))
+        await interaction.response.send_message("大崎さんに交渉を依頼しました。", ephemeral=True)
 
 class CandidateConfirmView(discord.ui.View):
-    def __init__(self, shizuma_id, osaki_name, candidate_id):
+    def __init__(self, session, shizuma_id, osaki_name, candidate_id): # session を追加
         super().__init__(timeout=None)
+        self.session = session # 保存
         self.shizuma_id = shizuma_id
-        self.osaki_name = osaki_name # この場合、指名した人の名前が入ります
+        self.osaki_name = osaki_name 
         self.candidate_id = candidate_id
 
     @discord.ui.button(label="確認", style=discord.ButtonStyle.success)
     async def confirm(self, interaction, button):
+        self.session.set_lover(self.candidate_id, self.shizuma_id)
+
         # 静馬さんにDMを送信
-        shizuma_user = interaction.client.get_user(self.shizuma_id)
-        if shizuma_user:
-            await shizuma_user.send("恋人成立処理が完了しました。")
+        try:
+            shizuma_user = await interaction.client.fetch_user(self.shizuma_id)
+            if shizuma_user:
+                await shizuma_user.send("恋人成立処理が完了しました。")
+        except Exception as e:
+            print(f"静馬への通知失敗: {e}")
         
         # 押した人（大崎さん）へのフィードバック
         await interaction.response.send_message("確認しました。恋人関係が確定しました。")
