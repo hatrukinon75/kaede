@@ -420,4 +420,4 @@ async def startgame(interaction): await interaction.response.send_message(view=E
 
 raw_token = os.getenv('MY_BOT_SECRET_TOKEN')
 
-bot.run(raw_token)
+bot.run(MTUxMDk4MjU5MTMyNTU0MDQ4NA.GyQQ9L.TBlg3uKyvhZ6q0joLt2BxJayKHHU29g-hCEbco)
